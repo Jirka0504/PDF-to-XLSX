@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e . pytest
+      - run: pytest -q
+
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e . pyinstaller
+      - run: pyinstaller --onefile --noconsole -n pdf2xlsx-gui src/pdf2xlsx_enterprise/gui.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf2xlsx-gui-exe
+          path: dist/pdf2xlsx-gui.exe

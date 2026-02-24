@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2xlsx-enterprise"
+version = "0.1.0"
+description = "Enterprise multi-supplier PDF to XLSX converter"
+requires-python = ">=3.10"
+dependencies = [
+  "pdfplumber>=0.11.0",
+  "openpyxl>=3.1.0",
+]
+
+[project.scripts]
+pdf2xlsx = "pdf2xlsx_enterprise.cli:main"
+pdf2xlsx-gui = "pdf2xlsx_enterprise.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}

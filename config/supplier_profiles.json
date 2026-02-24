@@ -1,0 +1,14 @@
+{
+  "omnia": {
+    "options": {
+      "sheet_name": null,
+      "clear_existing": true,
+      "mapping": null
+    }
+  },
+  "generic": {
+    "options": {
+      "clear_existing": false
+    }
+  }
+}
