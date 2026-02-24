@@ -3,20 +3,17 @@ import re
 from typing import Dict, Any, List
 from .base import SupplierParser
 from ..types import ParseResult, LineItem
-from ..utils import normalize_ws, money_to_str
+from ..utils import normalize_ws
+
+
+def clean_number(s: str) -> str:
+    s = re.sub(r"[^0-9,\.]", "", s)
+    return s.replace(",", ".")
 
 
 class OmniaParser(SupplierParser):
     supplier_key = "omnia"
-    display_name = "Omnia (enterprise invoice layout)"
-
-    row_pattern = re.compile(
-        r"^(?P<code>[A-Z0-9\-]{3,})\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<qty>\d+)\s+PZ\s+"
-        r"(?P<price>\d+(?:[.,]\d+)?)\s+€\s+"
-        r"(?P<total>\d+(?:[.,]\d+)?)\s+€?$"
-    )
+    display_name = "Omnia (enterprise layout)"
 
     def can_parse(self, pdf_text_pages: List[str], tables: list) -> bool:
         text = "\n".join(pdf_text_pages).lower()
@@ -24,6 +21,7 @@ class OmniaParser(SupplierParser):
 
     def parse(self, pdf_text_pages: List[str], tables: list, options: Dict[str, Any]) -> ParseResult:
         lines = []
+
         for page in pdf_text_pages:
             for l in (page or "").splitlines():
                 l = normalize_ws(l)
@@ -33,65 +31,52 @@ class OmniaParser(SupplierParser):
         items: List[LineItem] = []
         warnings: List[str] = []
 
-        in_table = False
+        pending_prefix = None
+        pending_code = None
         pending_desc = None
 
         for line in lines:
 
-            if "PRODUCT CODE" in line and "DESCRIPTION" in line:
-                in_table = True
+            # VEN-
+            if re.fullmatch(r"[A-Z]{2,6}-", line):
+                pending_prefix = line
                 continue
 
-            if not in_table:
+            # 161.167
+            if pending_prefix and re.fullmatch(r"\d+(?:\.\d+)+", line):
+                pending_code = pending_prefix + line
+                pending_prefix = None
                 continue
 
-            if line.startswith("TOTALE") or line.startswith("IMPONIBILE"):
-                break
+            # popis (D.35.8 SHOWER)
+            if pending_code and not re.search(r"\bPZ\b", line):
+                pending_desc = line
+                continue
 
-            m = self.row_pattern.match(line)
-            if m:
-                code = m.group("code")
-                desc = m.group("desc")
-                qty = m.group("qty")
-                price = money_to_str(m.group("price"))
-                total = money_to_str(m.group("total"))
+            # čísla (5 PZ 2.45 € 12.25 €)
+            m = re.search(r"(\d+)\s+PZ\s+([\d.,]+)\s*€\s+([\d.,]+)", line)
+            if m and pending_code and pending_desc:
+                qty = clean_number(m.group(1))
+                price = clean_number(m.group(2))
+                total = clean_number(m.group(3))
 
                 item = LineItem(
-                    product_number=code,
-                    product_name=desc,
+                    product_number=pending_code,
+                    product_name=pending_desc,
                     delivered_qty=qty,
                     net_unit_price=price,
                     total_price=total,
                     customs_code="",
                     weight_g=""
                 )
+
                 items.append(item)
-                continue
 
-            # zachytí případy kdy je popis na řádku nad tím
-            if re.search(r"\d+\s+PZ\s+\d", line):
-                parts = line.split()
-                if len(parts) >= 5:
-                    code = parts[0]
-                    qty = parts[-5]
-                    price = money_to_str(parts[-3])
-                    total = money_to_str(parts[-1])
-
-                    desc = " ".join(parts[1:-5])
-
-                    item = LineItem(
-                        product_number=code,
-                        product_name=desc,
-                        delivered_qty=qty,
-                        net_unit_price=price,
-                        total_price=total,
-                        customs_code="",
-                        weight_g=""
-                    )
-                    items.append(item)
+                pending_code = None
+                pending_desc = None
 
         if not items:
-            warnings.append("OmniaParser: Nenalezeny žádné položky.")
+            warnings.append("Nenalezeny žádné položky.")
 
         return ParseResult(
             header={"supplier": "omnia"},
