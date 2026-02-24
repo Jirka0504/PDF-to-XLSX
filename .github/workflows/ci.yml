@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -e . pyinstaller
-      - run: pyinstaller --onefile --noconsole -n pdf2xlsx-gui src/pdf2xlsx_enterprise/gui.py
+      - run: pyinstaller --onefile --noconsole -n pdf2xlsx-gui app_gui.py
       - uses: actions/upload-artifact@v4
         with:
           name: pdf2xlsx-gui-exe
