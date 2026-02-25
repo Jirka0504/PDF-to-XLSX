@@ -1,228 +1,188 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from .base import SupplierParser
 from ..types import ParseResult, LineItem
 from ..utils import normalize_ws
 
 
-def clean_number(s: str) -> str:
+# Matches a COMPLETE invoice line that ends with: "<qty> PZ <price> € <total> €"
+# Example:
+# 125709 LAMP COVER 40W - GORENJE 125709 100 PZ 1.15 € 115.00 €
+ROW_RE = re.compile(
+    r"^(?P<code>[A-Z0-9][A-Z0-9\-.]*)\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<qty>\d+(?:[.,]\d+)?)\s+PZ\s+"
+    r"(?P<price>\d+(?:[.,]\d+)?)\s*€\s+"
+    r"(?P<total>\d+(?:[.,]\d+)?)\s*€\s*$"
+)
+
+# Matches split code lines like:
+# "SS 2230002839"   (desc on next line)
+# "VEN 149198350"   (desc on next line)
+SPLIT_CODE_RE = re.compile(r"^(SS|VEN)\s+([0-9][0-9\-.]*)\s*$", re.IGNORECASE)
+
+# Matches a "code-only-ish" line that likely needs continuation
+CODE_ONLY_HINT_RE = re.compile(r"^(SS|VEN)\b", re.IGNORECASE)
+
+
+def _to_number_str(s: str) -> str:
     """
-    Normalize numeric strings to "1234.56" (dot decimal) and strip non-numeric chars.
+    Keep only a normalized numeric string:
+    - removes spaces and €
+    - converts comma to dot
     """
     s = (s or "").strip()
-    s = re.sub(r"[^0-9,\.]", "", s)
-
-    # "1,23" -> "1.23" (if only comma present)
-    if s.count(",") == 1 and s.count(".") == 0:
-        s = s.replace(",", ".")
-
-    # "1,234.56" or "1.234,56" -> best effort: remove thousands separator commas
-    if s.count(".") >= 1 and s.count(",") >= 1:
-        # assume comma thousands
-        s = s.replace(",", "")
-
+    s = s.replace("€", "").replace(" ", "")
+    s = s.replace(",", ".")
+    # Keep digits and single dot
+    s = re.sub(r"[^0-9.]", "", s)
+    # If multiple dots, keep first as decimal separator, remove others
+    if s.count(".") > 1:
+        first, *rest = s.split(".")
+        s = first + "." + "".join(rest)
     return s
 
 
+def _clean_line(line: str) -> str:
+    line = line or ""
+    # Normalize whitespace
+    line = normalize_ws(line)
+    # Replace common PDF odd spaces
+    line = line.replace("\u00A0", " ").replace("\uf0be", " ").replace("\uf0a7", " ")
+    line = normalize_ws(line)
+    return line.strip()
+
+
+def _is_header_or_total(line: str) -> bool:
+    l = (line or "").strip().lower()
+    if not l:
+        return True
+    # Skip headers / footers / totals
+    if l.startswith("product code description quantity"):
+        return True
+    if l.startswith("totale"):
+        return True
+    if l.startswith("totale da pagare"):
+        return True
+    if l.startswith("spese"):
+        return True
+    if l.startswith("fattura"):
+        return True
+    if "omniacomponents" in l:
+        return True
+    return False
+
+
 class OmniaParser(SupplierParser):
-    """
-    Omnia invoice (table with: PRODUCT CODE, DESCRIPTION, QUANTITY, PREZZO, ...)
-
-    Handles:
-    - one-line items:
-        125709  LAMP ...  100 PZ  1.15 €  115.00 €
-    - two-line items:
-        125709  LAMP ...
-        100 PZ  1.15 €  115.00 €
-    - prefix-only codes split:
-        VEN-
-        9161.167  D.35.8 SHOWER
-        1 PZ  1.95 €  1.95 €
-    - "merged prefix + first word of description" bug:
-        SS-POIGNEE  EQUIPEE C&S MULTI
-        2230002839
-        2 PZ  8.82 €  17.63 €
-      => SS-2230002839 + POIGNEE EQUIPEE C&S MULTI
-    """
-
     supplier_key = "omnia"
-    display_name = "Omnia (enterprise invoice)"
+    display_name = "Omnia (enterprise invoice layout)"
 
-    # Full row: CODE + DESC + QTY PZ + PRICE € + TOTAL €
-    _row_full_re = re.compile(
-        r"^(?P<code>[A-Z0-9][A-Z0-9\-\./]{2,})\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<qty>\d+)\s+PZ\s+"
-        r"(?P<price>[\d.,]+)\s*€\s+"
-        r"(?P<total>[\d.,]+)\s*€?\s*$"
-    )
-
-    # Quantity line (for 2-line items)
-    _qty_line_re = re.compile(
-        r"^(?P<qty>\d+)\s+PZ\s+"
-        r"(?P<price>[\d.,]+)\s*€\s+"
-        r"(?P<total>[\d.,]+)\s*€?\s*$"
-    )
-
-    # Prefix-only line like "VEN-" or "SS-"
-    _prefix_only_re = re.compile(r"^[A-Z]{2,8}-$")
-
-    # First token must look like a product code
-    _code_token_re = re.compile(r"^[A-Z0-9][A-Z0-9\-\./]{2,}$")
-
-    def can_parse(self, pdf_text_pages: List[str], tables: list) -> bool:
+    def can_parse(self, pdf_text_pages: List[str], tables: Any) -> bool:
         text = "\n".join(pdf_text_pages).lower()
-        return ("omniacomponents" in text) or ("26vin" in text) or ("product code" in text)
+        # Omnia PDFs contain these markers (invoice number 26VIN..., company name)
+        return ("omnia components" in text) or ("26vin" in text)
 
-    @staticmethod
-    def _is_header_line(s: str) -> bool:
-        lo = (s or "").lower()
-        header_words = ("product", "code", "description", "quantity", "prezzo", "sconto", "importo", "totale")
-        hits = sum(1 for w in header_words if w in lo)
-        return hits >= 3
-
-    def parse(self, pdf_text_pages: List[str], tables: list, options: Dict[str, Any]) -> ParseResult:
-        # Flatten and normalize lines
-        lines: List[str] = []
-        for page in pdf_text_pages:
-            for l in (page or "").splitlines():
-                l = normalize_ws(l)
-                if l:
-                    lines.append(l)
-
-        items: List[LineItem] = []
+    def parse(
+        self,
+        pdf_text_pages: List[str],
+        tables: Any,
+        options: Dict[str, Any],
+    ) -> ParseResult:
         warnings: List[str] = []
+        items: List[LineItem] = []
 
-        pending_prefix: str | None = None          # e.g. "VEN-" / "SS-"
-        pending_code: str | None = None            # e.g. "125709" or "SS-2230002839"
-        pending_desc: str | None = None            # description buffer
-        pending_prefix_desc: str | None = None     # e.g. "POIGNEE EQUIPEE C&S MULTI" when token becomes SS-POIGNEE
-
-        for line in lines:
-            # 0) skip headers
-            if self._is_header_line(line):
-                continue
-
-            # 1) prefix-only line e.g. "VEN-"
-            if self._prefix_only_re.fullmatch(line):
-                pending_prefix = line
-                pending_code = None
-                pending_desc = None
-                # do NOT clear pending_prefix_desc here; new prefix resets meaning
-                pending_prefix_desc = None
-                continue
-
-            # 2) FULL one-line item
-            m = self._row_full_re.match(line)
-            if m:
-                code = m.group("code").strip()
-                desc = m.group("desc").strip()
-                qty = clean_number(m.group("qty"))
-                price = clean_number(m.group("price"))
-                total = clean_number(m.group("total"))
-
-                if pending_prefix:
-                    code = pending_prefix + code
-                    pending_prefix = None
-
-                # if we previously captured prefix-desc, prepend it and clear
-                if pending_prefix_desc:
-                    desc = (pending_prefix_desc + " " + desc).strip()
-                    pending_prefix_desc = None
-
-                items.append(
-                    LineItem(
-                        product_number=code,
-                        product_name=desc,
-                        delivered_qty=qty,
-                        net_unit_price=price,
-                        total_price=total,
-                        customs_code="",
-                        weight_g="",
-                    )
-                )
-                pending_code = None
-                pending_desc = None
-                continue
-
-            # 2.5) Special case: we have prefix+desc first (SS-POIGNEE...), then a numeric-only line is the code
-            if pending_prefix and pending_prefix_desc and re.fullmatch(r"\d{6,}", line):
-                pending_code = pending_prefix + line
-                pending_desc = pending_prefix_desc
-                pending_prefix = None
-                pending_prefix_desc = None
-                continue
-
-            # 3) Quantity line attaches to buffered code+desc
-            q = self._qty_line_re.match(line)
-            if q and pending_code and pending_desc:
-                qty = clean_number(q.group("qty"))
-                price = clean_number(q.group("price"))
-                total = clean_number(q.group("total"))
-
-                items.append(
-                    LineItem(
-                        product_number=pending_code,
-                        product_name=pending_desc,
-                        delivered_qty=qty,
-                        net_unit_price=price,
-                        total_price=total,
-                        customs_code="",
-                        weight_g="",
-                    )
-                )
-                pending_code = None
-                pending_desc = None
-                continue
-
-            # 4) "CODE + rest..." candidate (first line of 2-line item)
-            parts = line.split(" ", 1)
-            if len(parts) == 2 and self._code_token_re.fullmatch(parts[0]):
-                token = parts[0].strip()
-                rest = parts[1].strip()
-
-                # 4a) Handle merged prefix+first-word-of-description like "SS-POIGNEE"
-                # Detect: PREFIX + WORD (letters only), no digits inside the token
-                m_pref = re.fullmatch(r"(?P<prefix>[A-Z]{2,8}-)(?P<word>[A-Z]{2,})", token)
-                if m_pref and not re.search(r"\d", token):
-                    pending_prefix = m_pref.group("prefix")
-                    pending_prefix_desc = (m_pref.group("word") + " " + rest).strip()
-                    pending_code = None
-                    pending_desc = None
+        # Flatten PDF text into cleaned lines
+        raw_lines: List[str] = []
+        for page in pdf_text_pages:
+            for ln in (page or "").splitlines():
+                ln = _clean_line(ln)
+                if not ln:
                     continue
+                if _is_header_or_total(ln):
+                    continue
+                raw_lines.append(ln)
 
-                # normal code+desc buffering
-                pending_code = token
-                pending_desc = rest
+        # Build "logical rows" by buffering until ROW_RE matches
+        buf: str = ""
+        pending_code_prefix: Optional[str] = None  # For cases like "SS 2230002839" alone
 
-                if pending_prefix:
-                    pending_code = pending_prefix + pending_code
-                    pending_prefix = None
+        def try_emit(candidate: str) -> bool:
+            m = ROW_RE.match(candidate)
+            if not m:
+                return False
 
-                # if we already captured prefix-desc earlier, prepend it now
-                if pending_prefix_desc:
-                    pending_desc = (pending_prefix_desc + " " + pending_desc).strip()
-                    pending_prefix_desc = None
+            code = m.group("code").strip()
+            desc = m.group("desc").strip()
+            qty = _to_number_str(m.group("qty"))
+            price = _to_number_str(m.group("price"))
+            total = _to_number_str(m.group("total"))
 
+            # basic numeric sanity
+            if not qty or not price or not total:
+                warnings.append(f"Skipping row (bad numbers): {candidate}")
+                return True  # consumed
+
+            # Unit is always PZ in this invoice
+            unit = "PZ"
+
+            # Produce a minimal, stable LineItem dict (writer/mapping can map keys to XLSX columns)
+            items.append(
+                {
+                    "supplier_product_code": code,  # "Kód zboží dodavatele"
+                    "product_code": code,           # "Kód zboží" (often same for you)
+                    "name": desc,                   # "Název zboží"
+                    "mj": unit,                     # "MJ"
+                    "quantity": qty,                # "Množství"
+                    "unit_price": price,            # "Cena za jednotku"
+                    "total_price": total,           # "Cena celkem"
+                }
+            )
+            return True
+
+        for ln in raw_lines:
+            # If we have a split-code line like "SS 2230002839"
+            m_split = SPLIT_CODE_RE.match(ln)
+            if m_split:
+                prefix = m_split.group(1).upper()
+                num = m_split.group(2)
+                pending_code_prefix = f"{prefix}-{num}"
+                buf = pending_code_prefix  # start buffer with the fixed code
                 continue
 
-            # 5) Continuation of description while we wait for quantity line
-            if pending_code and pending_desc:
-                # ignore accidental headers
-                if not self._is_header_line(line):
-                    pending_desc = (pending_desc + " " + line).strip()
+            # If line starts with "SS-" / "VEN-" like "SS￾223..." or "VEN￾149..."
+            # normalize weird separators into dash if it looks like "SS 223..." merged
+            ln_norm = ln
+            ln_norm = re.sub(r"^(SS|VEN)\s+([0-9])", r"\1-\2", ln_norm, flags=re.IGNORECASE)
+
+            # If buffer empty, start it
+            if not buf:
+                buf = ln_norm
+            else:
+                # Append continuation with a space
+                buf = f"{buf} {ln_norm}"
+
+            buf = _clean_line(buf)
+
+            # Try emit; if not match, keep buffering
+            if try_emit(buf):
+                buf = ""
+                pending_code_prefix = None
                 continue
 
-            # otherwise ignore
+            # Some PDFs create short lines like "SS-POIGNEE" (bad OCR join).
+            # If buffer grows too long without matching, reset defensively.
+            if len(buf) > 500:
+                warnings.append(f"Buffer too long, reset: {buf[:120]}...")
+                buf = ""
+                pending_code_prefix = None
 
-        if not items:
-            warnings.append("OmniaParser: Nenalezeny položky. Ověř, že PDF obsahuje řádky s 'PZ' a cenami s €.")
+        # Try last buffer
+        if buf and not try_emit(buf):
+            # If last buffer looks like code-only, ignore quietly; else warn
+            if not CODE_ONLY_HINT_RE.match(buf):
+                warnings.append(f"Unparsed tail: {buf}")
 
-        return ParseResult(header={"supplier": "omnia"}, items=items, warnings=warnings)
-
-
-def create() -> OmniaParser:
-    return OmniaParser()
+        return {"items": items, "warnings": warnings}
