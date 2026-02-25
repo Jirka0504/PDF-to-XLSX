@@ -27,97 +27,86 @@ class OmniaParser(SupplierParser):
         return ("omniacomponents" in text) or ("26vin" in text) or ("invoice" in text)
 
     def parse(self, pdf_text_pages: List[str], tables: list, options: Dict[str, Any]) -> ParseResult:
-        lines: List[str] = []
-        for page in pdf_text_pages:
-            for l in (page or "").splitlines():
-                l = normalize_ws(l)
-                if l:
-                    lines.append(l)
+    # 1) připrav řádky
+    lines: List[str] = []
+    for page in pdf_text_pages:
+        for l in (page or "").splitlines():
+            l = normalize_ws(l)
+            if l:
+                lines.append(l)
 
-        items: List[LineItem] = []
-        warnings: List[str] = []
+    items: List[LineItem] = []
+    warnings: List[str] = []
 
-        for i, line in enumerate(lines):
-            m = NUMS_LINE.search(line)
-            if not m:
-                continue
+    # 2) regex pro celý řádek položky:
+    #    CODE  DESCRIPTION ...  100 PZ  1.15 €  115.00 €
+    row_re = re.compile(
+        r"^(?P<code>[A-Z0-9][A-Z0-9\-\./]{2,})\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<qty>\d+)\s+PZ\s+"
+        r"(?P<price>[\d.,]+)\s*€\s+"
+        r"(?P<total>[\d.,]+)\s*€?\s*$"
+    )
 
-            qty = clean_number(m.group(1))
-            price = clean_number(m.group(2))
-            total = clean_number(m.group(3))
+    prefix_only = re.compile(r"^[A-Z]{2,8}-$")  # VEN-
 
-            # --- najdi kód + popis v řádcích NAD tím ---
-            code = ""
-            desc = ""
+    pending_prefix: str | None = None
+    buffer = ""
 
-            # vezmi okno max 4 řádky zpět
-            window = lines[max(0, i - 4): i]
+    def clean_number(s: str) -> str:
+        s = re.sub(r"[^0-9,\.]", "", s)
+        return s.replace(",", ".")
 
-            # 1) speciálně: VEN- + 161.167
-            for w_idx in range(len(window) - 1):
-                a = window[w_idx]
-                b = window[w_idx + 1]
-                if PREFIX_ONLY.fullmatch(a) and SUFFIX_DOTS.fullmatch(b):
-                    code = a + b
-                    # popis bude ideálně hned po tom (pokud existuje), jinak poslední řádek okna
-                    if w_idx + 2 < len(window):
-                        desc = window[w_idx + 2]
-                    else:
-                        desc = window[-1] if window else ""
-                    break
+    for line in lines:
+        # VEN- na samostatném řádku
+        if prefix_only.fullmatch(line):
+            pending_prefix = line
+            buffer = ""  # reset bufferu
+            continue
 
-            # 2) běžně: kód je první token na řádku (nebo samostatný řádek)
-            if not code:
-                # jdeme odzadu: nejblíž k číslům bývá popis
-                for back in range(1, min(4, i) + 1):
-                    cand = lines[i - back]
-                    parts = cand.split()
+        # Některé popisy se mohou zalomit -> skládáme buffer
+        buffer = (buffer + " " + line).strip() if buffer else line
 
-                    if not parts:
-                        continue
+        m = row_re.match(buffer)
+        if not m:
+            # ještě nemáme kompletní řádek -> čekáme na další řádek
+            # ale buffer nenecháme růst donekonečna
+            if len(buffer) > 400:
+                buffer = ""
+            continue
 
-                    # samostatný kód
-                    if CODE_TOKEN.fullmatch(parts[0]) and len(parts) == 1:
-                        code = parts[0]
-                        # popis bude řádek pod tím (blíž k číslům), pokud existuje
-                        if i - back + 1 < i:
-                            desc = lines[i - back + 1]
-                        break
+        code = m.group("code")
+        desc = m.group("desc").strip()
+        qty = clean_number(m.group("qty"))
+        price = clean_number(m.group("price"))
+        total = clean_number(m.group("total"))
 
-                    # kód + popis na jednom řádku
-                    if CODE_TOKEN.fullmatch(parts[0]) and len(parts) > 1:
-                        code = parts[0]
-                        desc = " ".join(parts[1:])
-                        break
+        if pending_prefix:
+            code = pending_prefix + code   # VEN- + 9161.167 => VEN-9161.167
+            pending_prefix = None
 
-            # 3) fallback: když nemáme popis, vezmi řádek těsně nad čísly
-            if not desc and i - 1 >= 0:
-                desc = lines[i - 1]
-
-            # pokud se ani tak nepodaří kód, přeskoč (nechceme plnit nesmysly)
-            if not code:
-                continue
-
-            items.append(
-                LineItem(
-                    product_number=code,
-                    product_name=desc,
-                    delivered_qty=qty,
-                    net_unit_price=price,
-                    total_price=total,
-                    customs_code="",
-                    weight_g="",
-                )
+        items.append(
+            LineItem(
+                product_number=code,
+                product_name=desc,
+                delivered_qty=qty,
+                net_unit_price=price,
+                total_price=total,
+                customs_code="",
+                weight_g="",
             )
-
-        if not items:
-            warnings.append("OmniaParser: Nenalezeny žádné položky (zkontroluj, že řádky obsahují 'PZ' a ceny s €).")
-
-        return ParseResult(
-            header={"supplier": "omnia"},
-            items=items,
-            warnings=warnings
         )
+
+        buffer = ""  # připrav se na další položku
+
+    if not items:
+        warnings.append("OmniaParser: Nenalezeny žádné položky (neodpovídá formát řádků s 'PZ' a €).")
+
+    return ParseResult(
+        header={"supplier": "omnia"},
+        items=items,
+        warnings=warnings
+    )
 
 
 def create() -> OmniaParser:
