@@ -14,39 +14,44 @@ def clean_number(s: str) -> str:
     """
     s = (s or "").strip()
     s = re.sub(r"[^0-9,\.]", "", s)
-    # If comma is decimal separator, normalize to dot
-    # (most Omnia PDFs use dot, but be defensive)
+
+    # "1,23" -> "1.23" (if only comma present)
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
-    # If both separators exist, assume comma is thousands separator -> remove commas
+
+    # "1,234.56" or "1.234,56" -> best effort: remove thousands separator commas
     if s.count(".") >= 1 and s.count(",") >= 1:
+        # assume comma thousands
         s = s.replace(",", "")
+
     return s
 
 
 class OmniaParser(SupplierParser):
     """
-    Omnia invoice layout.
+    Omnia invoice (table with: PRODUCT CODE, DESCRIPTION, QUANTITY, PREZZO, ...)
 
-    We MUST NOT naive-concatenate arbitrary lines, because PDF text often contains a header like:
-      "PRODUCT CODE DESCRIPTION QUANTITY PREZZO ..."
-
-    Real items can appear as:
-      A) Full single line:
-         125709  LAMP COVER 40W - GORENJE 125709  100 PZ  1.15 €  115.00 €
-      B) Split across 2 lines:
-         125709  LAMP COVER 40W - GORENJE 125709
-         100 PZ  1.15 €  115.00 €
-      C) Special split code:
-         VEN-
-         9161.167  D.35.8 SHOWER
-         1 PZ  1.95 €  1.95 €
+    Handles:
+    - one-line items:
+        125709  LAMP ...  100 PZ  1.15 €  115.00 €
+    - two-line items:
+        125709  LAMP ...
+        100 PZ  1.15 €  115.00 €
+    - prefix-only codes split:
+        VEN-
+        9161.167  D.35.8 SHOWER
+        1 PZ  1.95 €  1.95 €
+    - "merged prefix + first word of description" bug:
+        SS-POIGNEE  EQUIPEE C&S MULTI
+        2230002839
+        2 PZ  8.82 €  17.63 €
+      => SS-2230002839 + POIGNEE EQUIPEE C&S MULTI
     """
 
     supplier_key = "omnia"
     display_name = "Omnia (enterprise invoice)"
 
-    # Full row pattern: CODE + DESC + QTY PZ + PRICE € + TOTAL €
+    # Full row: CODE + DESC + QTY PZ + PRICE € + TOTAL €
     _row_full_re = re.compile(
         r"^(?P<code>[A-Z0-9][A-Z0-9\-\./]{2,})\s+"
         r"(?P<desc>.+?)\s+"
@@ -55,14 +60,14 @@ class OmniaParser(SupplierParser):
         r"(?P<total>[\d.,]+)\s*€?\s*$"
     )
 
-    # Second line pattern (for 2-line items): "100 PZ 1.15 € 115.00 €"
+    # Quantity line (for 2-line items)
     _qty_line_re = re.compile(
         r"^(?P<qty>\d+)\s+PZ\s+"
         r"(?P<price>[\d.,]+)\s*€\s+"
         r"(?P<total>[\d.,]+)\s*€?\s*$"
     )
 
-    # Prefix-only line (e.g., "VEN-")
+    # Prefix-only line like "VEN-" or "SS-"
     _prefix_only_re = re.compile(r"^[A-Z]{2,8}-$")
 
     # First token must look like a product code
@@ -70,22 +75,17 @@ class OmniaParser(SupplierParser):
 
     def can_parse(self, pdf_text_pages: List[str], tables: list) -> bool:
         text = "\n".join(pdf_text_pages).lower()
-        return ("omniacomponents" in text) or ("26vin" in text) or ("invoice" in text)
+        return ("omniacomponents" in text) or ("26vin" in text) or ("product code" in text)
 
     @staticmethod
     def _is_header_line(s: str) -> bool:
-        """
-        Detects header lines like:
-          PRODUCT CODE DESCRIPTION QUANTITY PREZZO ...
-        We skip them completely to prevent mixing into item descriptions.
-        """
         lo = (s or "").lower()
         header_words = ("product", "code", "description", "quantity", "prezzo", "sconto", "importo", "totale")
         hits = sum(1 for w in header_words if w in lo)
         return hits >= 3
 
     def parse(self, pdf_text_pages: List[str], tables: list, options: Dict[str, Any]) -> ParseResult:
-        # Flatten and normalize text lines from PDF
+        # Flatten and normalize lines
         lines: List[str] = []
         for page in pdf_text_pages:
             for l in (page or "").splitlines():
@@ -96,24 +96,26 @@ class OmniaParser(SupplierParser):
         items: List[LineItem] = []
         warnings: List[str] = []
 
-        pending_prefix: str | None = None  # e.g. "VEN-"
-        pending_code: str | None = None
-        pending_desc: str | None = None
+        pending_prefix: str | None = None          # e.g. "VEN-" / "SS-"
+        pending_code: str | None = None            # e.g. "125709" or "SS-2230002839"
+        pending_desc: str | None = None            # description buffer
+        pending_prefix_desc: str | None = None     # e.g. "POIGNEE EQUIPEE C&S MULTI" when token becomes SS-POIGNEE
 
         for line in lines:
-            # 0) Skip table headers
+            # 0) skip headers
             if self._is_header_line(line):
                 continue
 
-            # 1) Prefix-only line like "VEN-"
+            # 1) prefix-only line e.g. "VEN-"
             if self._prefix_only_re.fullmatch(line):
                 pending_prefix = line
-                # reset pending code/desc; the next code will be prefixed
                 pending_code = None
                 pending_desc = None
+                # do NOT clear pending_prefix_desc here; new prefix resets meaning
+                pending_prefix_desc = None
                 continue
 
-            # 2) Try full one-line item parse (no buffering!)
+            # 2) FULL one-line item
             m = self._row_full_re.match(line)
             if m:
                 code = m.group("code").strip()
@@ -126,6 +128,11 @@ class OmniaParser(SupplierParser):
                     code = pending_prefix + code
                     pending_prefix = None
 
+                # if we previously captured prefix-desc, prepend it and clear
+                if pending_prefix_desc:
+                    desc = (pending_prefix_desc + " " + desc).strip()
+                    pending_prefix_desc = None
+
                 items.append(
                     LineItem(
                         product_number=code,
@@ -141,19 +148,25 @@ class OmniaParser(SupplierParser):
                 pending_desc = None
                 continue
 
-            # 3) If this line is "qty PZ price € total €", attach to previously seen code/desc
+            # 2.5) Special case: we have prefix+desc first (SS-POIGNEE...), then a numeric-only line is the code
+            if pending_prefix and pending_prefix_desc and re.fullmatch(r"\d{6,}", line):
+                pending_code = pending_prefix + line
+                pending_desc = pending_prefix_desc
+                pending_prefix = None
+                pending_prefix_desc = None
+                continue
+
+            # 3) Quantity line attaches to buffered code+desc
             q = self._qty_line_re.match(line)
             if q and pending_code and pending_desc:
-                code = pending_code
-                desc = pending_desc
                 qty = clean_number(q.group("qty"))
                 price = clean_number(q.group("price"))
                 total = clean_number(q.group("total"))
 
                 items.append(
                     LineItem(
-                        product_number=code,
-                        product_name=desc,
+                        product_number=pending_code,
+                        product_name=pending_desc,
                         delivered_qty=qty,
                         net_unit_price=price,
                         total_price=total,
@@ -165,31 +178,48 @@ class OmniaParser(SupplierParser):
                 pending_desc = None
                 continue
 
-            # 4) Otherwise: could be "CODE + DESCRIPTION..." (first line of a 2-line item)
+            # 4) "CODE + rest..." candidate (first line of 2-line item)
             parts = line.split(" ", 1)
             if len(parts) == 2 and self._code_token_re.fullmatch(parts[0]):
-                pending_code = parts[0].strip()
-                pending_desc = parts[1].strip()
+                token = parts[0].strip()
+                rest = parts[1].strip()
+
+                # 4a) Handle merged prefix+first-word-of-description like "SS-POIGNEE"
+                # Detect: PREFIX + WORD (letters only), no digits inside the token
+                m_pref = re.fullmatch(r"(?P<prefix>[A-Z]{2,8}-)(?P<word>[A-Z]{2,})", token)
+                if m_pref and not re.search(r"\d", token):
+                    pending_prefix = m_pref.group("prefix")
+                    pending_prefix_desc = (m_pref.group("word") + " " + rest).strip()
+                    pending_code = None
+                    pending_desc = None
+                    continue
+
+                # normal code+desc buffering
+                pending_code = token
+                pending_desc = rest
 
                 if pending_prefix:
                     pending_code = pending_prefix + pending_code
                     pending_prefix = None
 
+                # if we already captured prefix-desc earlier, prepend it now
+                if pending_prefix_desc:
+                    pending_desc = (pending_prefix_desc + " " + pending_desc).strip()
+                    pending_prefix_desc = None
+
                 continue
 
-            # 5) Or continuation of description (still waiting for qty/price line)
+            # 5) Continuation of description while we wait for quantity line
             if pending_code and pending_desc:
-                # Avoid appending if it's clearly not part of description
+                # ignore accidental headers
                 if not self._is_header_line(line):
                     pending_desc = (pending_desc + " " + line).strip()
                 continue
 
-            # else ignore unrelated lines
+            # otherwise ignore
 
         if not items:
-            warnings.append(
-                "OmniaParser: Nenalezeny položky. Ověř, že PDF obsahuje řádky s 'PZ' a cenami s €."
-            )
+            warnings.append("OmniaParser: Nenalezeny položky. Ověř, že PDF obsahuje řádky s 'PZ' a cenami s €.")
 
         return ParseResult(header={"supplier": "omnia"}, items=items, warnings=warnings)
 
