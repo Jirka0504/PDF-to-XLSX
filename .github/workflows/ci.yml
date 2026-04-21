@@ -1,31 +1,28 @@
-name: CI
+name: Build EXE
 
 on:
   push:
     branches: [ main ]
-  pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -e . pytest
-      - run: pytest -q
-
-  build-windows-exe:
+  build:
     runs-on: windows-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -e . pyinstaller
-      - run: pyinstaller --onefile --noconsole -n pdf2xlsx-gui app_gui.py
-      - uses: actions/upload-artifact@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --onefile --noconsole -n omnia-gui omnia_pdf_to_xlsx_gui.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
         with:
-          name: pdf2xlsx-gui-exe
-          path: dist/pdf2xlsx-gui.exe
+          name: omnia-gui
+          path: dist/omnia-gui.exe
