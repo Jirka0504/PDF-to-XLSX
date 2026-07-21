@@ -62,31 +62,288 @@ def parse_pdf(pdf_path: str):
     items = []
     warnings = []
 
+    # ---------------------------------------------------------
+    # DETEKCE NOVÉHO TYPU OMNIA
+    # ---------------------------------------------------------
+
+    full_text = "\n".join(lines).lower()
+
+    is_new_omnia = (
+        "code cust. item description qty. u.m. price amount vat c." in full_text
+        or (
+            "shipment no." in full_text
+            and "pcs" in full_text
+            and "omnia components" in full_text
+        )
+    )
+
+    # =========================================================
+    # NOVÝ OMNIA FORMÁT
+    # =========================================================
+
+    if is_new_omnia:
+
+        # běžný kompletní řádek:
+        #
+        # PLM002BO DRYER TUMBLE JOCKEY PULLEY-BOSCH 00632045
+        # 5 Pcs 1,05 5,25 41
+
+        new_row_re = re.compile(
+            r"""
+            ^
+            (?P<code>[A-Z0-9.\-]+)
+            \s+
+            (?P<name>.+?)
+            \s+
+            (?P<qty>\d+)
+            \s+Pcs
+            \s+
+            (?P<price>\d+(?:[.,]\d{2}))
+            \s+
+            (?P<total>\d+(?:[.,]\d{2}))
+            \s+
+            (?P<vat>\d+)
+            $
+            """,
+            re.VERBOSE | re.IGNORECASE,
+        )
+
+        # samotný konec řádku:
+        # 2 Pcs 1,35 2,70 41
+
+        new_tail_re = re.compile(
+            r"""
+            ^
+            (?P<qty>\d+)
+            \s+Pcs
+            \s+
+            (?P<price>\d+(?:[.,]\d{2}))
+            \s+
+            (?P<total>\d+(?:[.,]\d{2}))
+            \s+
+            (?P<vat>\d+)
+            $
+            """,
+            re.VERBOSE | re.IGNORECASE,
+        )
+
+        def decimal_new(value):
+            return float(
+                str(value)
+                .replace(" ", "")
+                .replace(".", "")
+                .replace(",", ".")
+            )
+
+        skip_prefixes_new = (
+            "Code Cust. Item",
+            "Shipment No.",
+            "Note:",
+            "Company Stamp",
+            "Parcel units:",
+            "Gross weight",
+            "Goods aspect:",
+            "Vat C.",
+            "Incoterm:",
+            "Shipment due to:",
+            "Shipping Agent:",
+            "Subscr. No.:",
+            "Truck. No.:",
+            "Shipping Starting Date",
+            "Driver signature:",
+            "Addresse signature:",
+            "SWIFT - Bank transfer",
+            "No. ",
+            "Via Travnik",
+            "Company subject",
+            "SDI Code:",
+            "VAT Registration",
+            "Ph:",
+            "Omnia Components Srl",
+            "KTS - AME",
+            "Czech Republic",
+            "Company:",
+            "Karla Čapka",
+            "Deliver to:",
+            "Invoice",
+            "Payment:",
+            "Paym. Method:",
+            "Net 60",
+            "Bill-to Customer",
+            "Due Dates:",
+            "Bank:",
+            "PAG",
+            "TOTAL DOCUMENT",
+            "Pursuant to",
+            "Delivery At Place",
+            "Fedex",
+        )
+
+        cleaned = []
+
+        for raw_line in lines:
+            line = normalize_text(raw_line)
+
+            if not line:
+                continue
+
+            if any(
+                line.startswith(prefix)
+                for prefix in skip_prefixes_new
+            ):
+                continue
+
+            cleaned.append(line)
+
+        i = 0
+
+        while i < len(cleaned):
+            line = cleaned[i]
+
+            # ---------------------------------------------
+            # DOPRAVA - VYNECHAT
+            # ---------------------------------------------
+
+            if line.startswith("TRASP.EU.VEN"):
+                i += 1
+                continue
+
+            if "Shipping Fees" in line:
+                i += 1
+                continue
+
+            # ---------------------------------------------
+            # 1) BĚŽNÝ KOMPLETNÍ ŘÁDEK
+            # ---------------------------------------------
+
+            m = new_row_re.match(line)
+
+            if m:
+                code = m.group("code").strip()
+
+                if code == "TRASP.EU.VEN":
+                    i += 1
+                    continue
+
+                items.append({
+                    "code": code,
+                    "name": m.group("name").strip(),
+                    "qty": int(m.group("qty")),
+                    "total": decimal_new(
+                        m.group("total")
+                    ),
+                })
+
+                i += 1
+                continue
+
+            # ---------------------------------------------
+            # 2) VÍCEŘÁDKOVÁ POLOŽKA
+            #
+            # LFT003UN WASHING MACHINE RUBBER ...
+            # SKL
+            # 2 Pcs 1,35 2,70 41
+            # ---------------------------------------------
+
+            start = re.match(
+                r"^(?P<code>[A-Z0-9.\-]+)\s+(?P<name>.+)$",
+                line,
+            )
+
+            if start:
+                code = start.group("code").strip()
+
+                if code == "TRASP.EU.VEN":
+                    i += 1
+                    continue
+
+                name_parts = [
+                    start.group("name").strip()
+                ]
+
+                j = i + 1
+                found = False
+
+                while j < len(cleaned):
+                    nxt = cleaned[j]
+
+                    tail = new_tail_re.match(nxt)
+
+                    if tail:
+                        items.append({
+                            "code": code,
+                            "name": " ".join(
+                                name_parts
+                            ).strip(),
+                            "qty": int(
+                                tail.group("qty")
+                            ),
+                            "total": decimal_new(
+                                tail.group("total")
+                            ),
+                        })
+
+                        i = j + 1
+                        found = True
+                        break
+
+                    # pokud narazíme na další zjevnou položku,
+                    # ukončíme hledání
+                    if new_row_re.match(nxt):
+                        break
+
+                    name_parts.append(nxt)
+                    j += 1
+
+                if found:
+                    continue
+
+            i += 1
+
+        return items, warnings
+
+    # =========================================================
+    # STARÝ OMNIA FORMÁT
+    # =========================================================
+
     pending_code = None
 
     full_row_re = re.compile(
         r"""
         ^
-        (?P<code>[A-Z0-9\-.]+)\s+
-        (?P<name>.+?)\s+
-        (?P<qty>\d+)\s+PZ\s+
-        (?P<price>\d+(?:[.,]\d{2}))\s+€\s+
-        (?P<total>\d+(?:[.,]\d{2}))\s+€
+        (?P<code>[A-Z0-9\-.]+)
+        \s+
+        (?P<name>.+?)
+        \s+
+        (?P<qty>\d+)
+        \s+PZ
+        \s+
+        (?P<price>\d+(?:[.,]\d{2}))
+        \s+€
+        \s+
+        (?P<total>\d+(?:[.,]\d{2}))
+        \s+€
         $
         """,
-        re.VERBOSE,
+        re.VERBOSE | re.IGNORECASE,
     )
 
     cont_row_re = re.compile(
         r"""
         ^
-        (?P<name>.+?)\s+
-        (?P<qty>\d+)\s+PZ\s+
-        (?P<price>\d+(?:[.,]\d{2}))\s+€\s+
-        (?P<total>\d+(?:[.,]\d{2}))\s+€
+        (?P<name>.+?)
+        \s+
+        (?P<qty>\d+)
+        \s+PZ
+        \s+
+        (?P<price>\d+(?:[.,]\d{2}))
+        \s+€
+        \s+
+        (?P<total>\d+(?:[.,]\d{2}))
+        \s+€
         $
         """,
-        re.VERBOSE,
+        re.VERBOSE | re.IGNORECASE,
     )
 
     skip_prefixes = (
@@ -119,54 +376,74 @@ def parse_pdf(pdf_path: str):
     for raw_line in lines:
         line = normalize_text(raw_line)
 
-        if any(line.startswith(prefix) for prefix in skip_prefixes):
+        # znak z PDF, který reprezentuje rozdělenou pomlčku
+        line = line.replace("￾", "-")
+
+        if any(
+            line.startswith(prefix)
+            for prefix in skip_prefixes
+        ):
             continue
 
-        if line.startswith("KTS - AME") or line.startswith("Karla Čapka") or line.startswith("500 02"):
+        if (
+            line.startswith("KTS - AME")
+            or line.startswith("Karla Čapka")
+            or line.startswith("500 02")
+        ):
             continue
 
-        # 1) Normální kompletní řádek
+        # ---------------------------------------------
+        # 1) normální kompletní řádek
+        # ---------------------------------------------
+
         m = full_row_re.match(line)
+
         if m:
             code = m.group("code").strip()
-            name = m.group("name").strip()
-            qty = int(m.group("qty"))
-            total = clean_number(m.group("total"))
 
             items.append({
                 "code": code,
-                "name": name,
-                "qty": qty,
-                "total": total,
+                "name": m.group("name").strip(),
+                "qty": int(m.group("qty")),
+                "total": clean_number(
+                    m.group("total")
+                ),
             })
+
             pending_code = None
             continue
 
-        # 2) Samostatný kód na řádku – další řádek je pokračování
+        # ---------------------------------------------
+        # 2) samostatný kód
+        # ---------------------------------------------
+
         if looks_like_code_only(line):
             pending_code = line
             continue
 
-        # 3) Pokračovací řádek bez kódu
-        m2 = cont_row_re.match(line)
-        if m2 and pending_code:
-            code = pending_code.strip()
-            name = m2.group("name").strip()
-            qty = int(m2.group("qty"))
-            total = clean_number(m2.group("total"))
+        # ---------------------------------------------
+        # 3) pokračovací řádek bez kódu
+        # ---------------------------------------------
 
+        m2 = cont_row_re.match(line)
+
+        if m2 and pending_code:
             items.append({
-                "code": code,
-                "name": name,
-                "qty": qty,
-                "total": total,
+                "code": pending_code.strip(),
+                "name": m2.group("name").strip(),
+                "qty": int(m2.group("qty")),
+                "total": clean_number(
+                    m2.group("total")
+                ),
             })
+
             pending_code = None
             continue
 
-        # 4) Ostatní ignoruj, ale jen pokud to nevypadá jako důležitý rozbitý řádek
-        if " PZ " in line or pending_code:
-            warnings.append(f"Nepodařilo se naparsovat řádek: {line}")
+        if " PZ " in line or " Pcs " in line:
+            warnings.append(
+                f"Nepodařilo se naparsovat řádek: {line}"
+            )
 
     return items, warnings
 
